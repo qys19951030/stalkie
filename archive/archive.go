@@ -637,9 +637,188 @@ func RecordFromResult(runID string, r checker.Result) Record {
 	}
 }
 
-// Merge merges several archive roots into one output view: newest record
-// per handle+platform is the current state, history is preserved, and the
-// same source archive imported twice counts only once.
+// importsFile tracks which source archives were already merged into a root.
+const importsFile = "imports.json"
+
+type importEntry struct {
+	ArchiveID  string    `json:"archive_id"`
+	ImportedAt time.Time `json:"imported_at"`
+}
+
+// Merge merges several archive roots into one output view: the newest
+// record per handle+platform becomes the current state (current.json),
+// the full history is preserved in records.jsonl, and importing the same
+// source archive twice counts only once.
 func Merge(inputs []string, outRoot string) error {
+	if len(inputs) == 0 {
+		return fmt.Errorf("no input archives given")
+	}
+	outID, err := ensureRootMeta(outRoot)
+	if err != nil {
+		return err
+	}
+
+	importsPath := filepath.Join(outRoot, importsFile)
+	var imports []importEntry
+	if err := readJSONL(importsPath, &imports); err != nil {
+		return err
+	}
+	seen := make(map[string]bool)
+	for _, imp := range imports {
+		seen[imp.ArchiveID] = true
+	}
+	seen[outID] = true // never merge a root into itself
+
+	// Existing record IDs per handle dir in the output, for dedup.
+	existingIDs := make(map[string]map[string]bool)
+
+	for _, inRoot := range inputs {
+		metaData, err := os.ReadFile(filepath.Join(inRoot, metaFile))
+		if err != nil {
+			return fmt.Errorf("%s is not an archive (missing %s): %w", inRoot, metaFile, err)
+		}
+		var meta rootMeta
+		if err := json.Unmarshal(metaData, &meta); err != nil || meta.ArchiveID == "" {
+			return fmt.Errorf("%s is not an archive (unreadable %s)", inRoot, metaFile)
+		}
+		if seen[meta.ArchiveID] {
+			continue // same archive imported twice counts once
+		}
+
+		handles, err := handleDirs(inRoot)
+		if err != nil {
+			return err
+		}
+		for _, handleDir := range handles {
+			var records []Record
+			if err := readJSONL(filepath.Join(inRoot, handleDir, recordsFile), &records); err != nil {
+				return err
+			}
+			if len(records) == 0 {
+				continue
+			}
+			outDir := filepath.Join(outRoot, handleDir)
+			if err := os.MkdirAll(outDir, 0o755); err != nil {
+				return fmt.Errorf("archive path not writable: %w", err)
+			}
+			ids, ok := existingIDs[outDir]
+			if !ok {
+				ids = make(map[string]bool)
+				var existing []Record
+				if err := readJSONL(filepath.Join(outDir, recordsFile), &existing); err != nil {
+					return err
+				}
+				for _, r := range existing {
+					ids[r.RecordID] = true
+				}
+				existingIDs[outDir] = ids
+			}
+			var fresh []any
+			for _, r := range records {
+				if r.RecordID == "" {
+					r.RecordID = r.RunID + ":" + r.Site
+				}
+				if ids[r.RecordID] {
+					continue
+				}
+				ids[r.RecordID] = true
+				fresh = append(fresh, r)
+			}
+			if err := appendJSONL(filepath.Join(outDir, recordsFile), fresh...); err != nil {
+				return err
+			}
+		}
+
+		imports = append(imports, importEntry{ArchiveID: meta.ArchiveID, ImportedAt: time.Now().UTC()})
+		seen[meta.ArchiveID] = true
+	}
+
+	// Rewrite the imports log (small, append-only semantics preserved by
+	// keeping every previous entry).
+	var items []any
+	for _, imp := range imports {
+		items = append(items, imp)
+	}
+	tmp := importsPath + ".tmp"
+	if err := func() error {
+		f, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
+		if err != nil {
+			return err
+		}
+		for _, item := range items {
+			data, err := json.Marshal(item)
+			if err != nil {
+				f.Close()
+				os.Remove(tmp)
+				return err
+			}
+			if _, err := f.Write(append(data, '\n')); err != nil {
+				f.Close()
+				os.Remove(tmp)
+				return err
+			}
+		}
+		if err := f.Sync(); err != nil {
+			f.Close()
+			os.Remove(tmp)
+			return err
+		}
+		return f.Close()
+	}(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, importsPath); err != nil {
+		return err
+	}
+
+	// Rebuild the merged current-state view for every handle in the output.
+	outHandles, err := handleDirs(outRoot)
+	if err != nil {
+		return err
+	}
+	for _, handleDir := range outHandles {
+		var records []Record
+		if err := readJSONL(filepath.Join(outRoot, handleDir, recordsFile), &records); err != nil {
+			return err
+		}
+		latest := make(map[string]Record)
+		for _, r := range records {
+			cur, ok := latest[r.Site]
+			if !ok || !r.CheckedAt.Before(cur.CheckedAt) {
+				latest[r.Site] = r
+			}
+		}
+		current := make([]Record, 0, len(latest))
+		for _, r := range latest {
+			current = append(current, r)
+		}
+		sort.Slice(current, func(i, j int) bool { return current[i].Site < current[j].Site })
+		data, err := json.MarshalIndent(current, "", "  ")
+		if err != nil {
+			return err
+		}
+		if err := os.WriteFile(filepath.Join(outRoot, handleDir, "current.json"), append(data, '\n'), 0o644); err != nil {
+			return err
+		}
+	}
 	return nil
+}
+
+// handleDirs lists the per-handle subdirectories of an archive root.
+func handleDirs(root string) ([]string, error) {
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return nil, err
+	}
+	var dirs []string
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		if _, err := os.Stat(filepath.Join(root, e.Name(), recordsFile)); err == nil {
+			dirs = append(dirs, e.Name())
+		}
+	}
+	sort.Strings(dirs)
+	return dirs, nil
 }
