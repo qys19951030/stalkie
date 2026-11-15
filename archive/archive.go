@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -415,25 +416,198 @@ func (a *Archive) LatestBySite() (map[string]Record, error) {
 }
 
 // DetectChanges compares fresh records against the baseline that existed
-// before the run started and returns the four kinds of changes.
+// before the run started and returns the four kinds of changes. Platforms
+// observed for the first time (no baseline) are not changes; platforms
+// whose state did not change are not listed either.
 func DetectChanges(run RunInfo, baseline map[string]Record, fresh []Record) []Change {
-	return nil
+	snapshot := func(r Record) Snapshot {
+		return Snapshot{
+			Found:      r.Found,
+			Confidence: r.Confidence,
+			Evidence:   r.Evidence,
+			CheckedAt:  r.CheckedAt,
+		}
+	}
+	var changes []Change
+	for _, rec := range fresh {
+		before, ok := baseline[rec.Site]
+		if !ok {
+			continue
+		}
+		mk := func(t ChangeType) Change {
+			return Change{
+				RunID:  run.RunID,
+				Handle: run.Handle,
+				Site:   rec.Site,
+				Type:   t,
+				Before: snapshot(before),
+				After:  snapshot(rec),
+			}
+		}
+		switch {
+		case !before.Found && rec.Found:
+			changes = append(changes, mk(ChangeNewHit))
+		case before.Found && !rec.Found:
+			changes = append(changes, mk(ChangeLostHit))
+		case before.Found && rec.Found:
+			if before.Evidence != rec.Evidence {
+				changes = append(changes, mk(ChangeEvidenceChanged))
+			}
+			if before.Confidence != rec.Confidence {
+				changes = append(changes, mk(ChangeConfidenceChanged))
+			}
+		}
+	}
+	sort.Slice(changes, func(i, j int) bool {
+		if changes[i].Site != changes[j].Site {
+			return changes[i].Site < changes[j].Site
+		}
+		return changes[i].Type < changes[j].Type
+	})
+	return changes
 }
 
 // AppendChanges persists detected changes to the changes log.
 func (a *Archive) AppendChanges(changes []Change) error {
-	return nil
+	if len(changes) == 0 {
+		return nil
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	items := make([]any, len(changes))
+	for i, c := range changes {
+		items[i] = c
+	}
+	return appendJSONL(filepath.Join(a.Dir, changesFile), items...)
 }
 
 // RecalcStats recomputes the statistics of the latest run purely from the
-// archive files on disk.
+// archive files on disk, so the numbers can always be reproduced by
+// rescanning the archive alone.
 func (a *Archive) RecalcStats() (Stats, error) {
-	return Stats{}, nil
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	stats := Stats{Handle: a.Handle}
+
+	var runs []RunInfo
+	if err := readJSONL(filepath.Join(a.Dir, runsFile), &runs); err != nil {
+		return stats, err
+	}
+	if len(runs) == 0 {
+		return stats, nil
+	}
+	latest := runs[0]
+	for _, r := range runs[1:] {
+		if r.StartedAt.After(latest.StartedAt) {
+			latest = r
+		}
+	}
+	stats.RunID = latest.RunID
+
+	var records []Record
+	if err := readJSONL(filepath.Join(a.Dir, recordsFile), &records); err != nil {
+		return stats, err
+	}
+
+	priorSites := make(map[string]bool)
+	var runRecords []Record
+	for _, r := range records {
+		if r.RunID == latest.RunID {
+			runRecords = append(runRecords, r)
+			continue
+		}
+		if r.CheckedAt.Before(latest.StartedAt) {
+			priorSites[r.Site] = true
+		}
+	}
+	stats.Skipped = len(priorSites)
+
+	stats.Submitted = len(runRecords)
+	compared := 0
+	for _, r := range runRecords {
+		if r.Found {
+			stats.Found++
+		}
+		switch r.Category {
+		case CategoryBlocked:
+			stats.Blocked++
+		case CategoryLoginRequired:
+			stats.LoginRequired++
+		case CategoryRedirected:
+			stats.Redirected++
+		case CategoryUnreachable:
+			stats.Unreachable++
+		}
+		if priorSites[r.Site] {
+			compared++
+		} else {
+			stats.FirstObserved++
+		}
+	}
+
+	var changes []Change
+	if err := readJSONL(filepath.Join(a.Dir, changesFile), &changes); err != nil {
+		return stats, err
+	}
+	changedSites := make(map[string]bool)
+	for _, c := range changes {
+		if c.RunID != latest.RunID {
+			continue
+		}
+		changedSites[c.Site] = true
+		switch c.Type {
+		case ChangeNewHit:
+			stats.NewHits++
+		case ChangeLostHit:
+			stats.LostHits++
+		case ChangeEvidenceChanged:
+			stats.EvidenceChanged++
+		case ChangeConfidenceChanged:
+			stats.ConfidenceChanged++
+		}
+	}
+	stats.Unchanged = compared - len(changedSites)
+	if stats.Unchanged < 0 {
+		stats.Unchanged = 0
+	}
+	return stats, nil
 }
 
 // WriteStats writes the human-readable and the structured statistics.
+// Both are generated from the same Stats value so they agree item by item.
 func (a *Archive) WriteStats(s Stats) error {
-	return nil
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	structured, err := json.MarshalIndent(s, "", "  ")
+	if err != nil {
+		return err
+	}
+	if err := os.WriteFile(filepath.Join(a.Dir, statsJSON), append(structured, '\n'), 0o644); err != nil {
+		return err
+	}
+
+	human := fmt.Sprintf(`Stalkie archive statistics
+handle:              %s
+run_id:              %s
+submitted:           %d
+found:               %d
+blocked:             %d
+login_required:      %d
+redirected:          %d
+unreachable:         %d
+skipped:             %d
+first_observed:      %d
+unchanged:           %d
+new_hits:            %d
+lost_hits:           %d
+evidence_changed:    %d
+confidence_changed:  %d
+`, s.Handle, s.RunID, s.Submitted, s.Found, s.Blocked, s.LoginRequired,
+		s.Redirected, s.Unreachable, s.Skipped, s.FirstObserved, s.Unchanged,
+		s.NewHits, s.LostHits, s.EvidenceChanged, s.ConfidenceChanged)
+	return os.WriteFile(filepath.Join(a.Dir, statsTXT), []byte(human), 0o644)
 }
 
 // RecordFromResult converts a checker result into an archive record.
