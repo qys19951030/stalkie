@@ -176,3 +176,94 @@ func TestEndToEndAvatarClustering(t *testing.T) {
 
 
 
+
+func TestOutcomeClassification(t *testing.T) {
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/ok":
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte("<html><head><title>ok profile</title></head><body>ok info</body></html>"))
+		case "/blocked":
+			w.WriteHeader(http.StatusForbidden)
+			w.Write([]byte("access denied"))
+		case "/login":
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte("<html><body>please log in</body></html>"))
+		case "/elsewhere":
+			http.Redirect(w, r, "/home", http.StatusFound)
+		case "/home":
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte("<html><head><title>home</title></head><body>welcome</body></html>"))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	// /profile/login redirects to the login page
+	mux := http.NewServeMux()
+	loginServer := httptest.NewServer(mux)
+	defer loginServer.Close()
+	mux.HandleFunc("/profile/", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "/login", http.StatusFound)
+	})
+	mux.HandleFunc("/login", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("<html><body>sign in</body></html>"))
+	})
+
+	client := server.Client()
+	client.Timeout = 2 * time.Second
+
+	mkSite := func(name, url string) loader.Site {
+		return loader.Site{Name: name, URL: url, ErrorType: "status_code", ErrorCode: 404}
+	}
+
+	resOK := Check(client, mkSite("OK", server.URL+"/ok"), "ok", 0, 0)
+	if resOK.Outcome != OutcomeNormal {
+		t.Errorf("expected outcome normal, got %q", resOK.Outcome)
+	}
+
+	resBlocked := Check(client, mkSite("Blocked", server.URL+"/blocked"), "blocked", 0, 0)
+	if resBlocked.Outcome != OutcomeBlocked {
+		t.Errorf("expected outcome blocked, got %q", resBlocked.Outcome)
+	}
+
+	resLogin := Check(client, mkSite("Login", loginServer.URL+"/profile/{}"), "someone", 0, 0)
+	if resLogin.Outcome != OutcomeLoginRequired {
+		t.Errorf("expected outcome login_required, got %q", resLogin.Outcome)
+	}
+
+	resRedir := Check(client, mkSite("Elsewhere", server.URL+"/elsewhere"), "elsewhere", 0, 0)
+	if resRedir.Outcome != OutcomeRedirected {
+		t.Errorf("expected outcome redirected, got %q", resRedir.Outcome)
+	}
+
+	badClient := server.Client()
+	badClient.Timeout = 1 * time.Millisecond
+	resDown := Check(badClient, mkSite("Down", "http://127.0.0.1:1/{}"), "down", 0, 0)
+	if resDown.Outcome != OutcomeUnreachable {
+		t.Errorf("expected outcome unreachable, got %q", resDown.Outcome)
+	}
+}
+
+func TestClassifyRedirectMatchesLegacyBehavior(t *testing.T) {
+	cases := []struct {
+		target, final, body string
+		wantClass           string
+	}{
+		{"https://x.com/u", "https://x.com/u", "hello", ""},
+		{"https://x.com/u", "https://x.com/login", "", OutcomeLoginRequired},
+		{"https://x.com/u", "https://x.com/u", "Log in to Instagram", OutcomeLoginRequired},
+		{"https://x.com/u", "https://x.com/home", "welcome", ""},
+	}
+	for _, c := range cases {
+		if got := classifyRedirect(c.target, c.final, c.body); got != c.wantClass {
+			t.Errorf("classifyRedirect(%q,%q)=%q want %q", c.target, c.final, got, c.wantClass)
+		}
+		if legacy := isRedirectToLoginOrHome(c.target, c.final, c.body); legacy != (c.wantClass == OutcomeLoginRequired) {
+			t.Errorf("legacy redirect check mismatch for %q -> %q", c.target, c.final)
+		}
+	}
+}

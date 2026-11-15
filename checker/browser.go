@@ -145,17 +145,25 @@ func checkWithBrowser(browser *rod.Browser, site loader.Site, username string, m
 
 	if !succeeded || body == "" {
 		result.Error = "browser failed to render target page"
+		result.Outcome = OutcomeUnreachable
 		return result
 	}
 
 	if isBlockedOrChallenge(200, body) {
 		result.Error = "browser detected anti-bot challenge or block"
+		result.Outcome = OutcomeBlocked
 		return result
 	}
 
-	if isRedirectToLoginOrHome(targetURL, finalURL, body) {
+	if cls := classifyRedirect(targetURL, finalURL, body); cls != "" {
 		result.Error = "redirected to login or authwall in browser mode"
+		result.Outcome = cls
 		return result
+	}
+
+	result.Outcome = OutcomeNormal
+	if finalURL != targetURL {
+		result.Outcome = OutcomeRedirected
 	}
 
 	result.Found, result.Confidence, result.Evidence = evaluateBrowserRender(site, username, body)

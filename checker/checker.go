@@ -15,6 +15,16 @@ import (
 	"github.com/ashendilantha/stalkie/matcher"
 )
 
+// Request outcome classifications recorded alongside each Result. They are
+// excluded from every export format and do not alter scan behavior.
+const (
+	OutcomeNormal        = "normal"
+	OutcomeBlocked       = "blocked"
+	OutcomeLoginRequired = "login_required"
+	OutcomeRedirected    = "redirected"
+	OutcomeUnreachable   = "unreachable"
+)
+
 type Result struct {
 	Username          string                   `json:"username"`
 	Site              string                   `json:"site"`
@@ -22,6 +32,7 @@ type Result struct {
 	Found             bool                     `json:"found"`
 	Confidence        int                      `json:"confidence"`
 	Evidence          string                   `json:"evidence"`
+	Outcome           string                   `json:"-"`
 	Metadata          ProfileMetadata          `json:"metadata,omitempty"`
 	ImageMatched      bool                     `json:"image_matched,omitempty"`
 	VisualSimilarity  int                      `json:"visual_similarity,omitempty"`
@@ -88,6 +99,7 @@ func CheckWithRenewerAndAvatar(client *http.Client, site loader.Site, username s
 		if reqErr != nil {
 			cancel()
 			result.Error = reqErr.Error()
+			result.Outcome = OutcomeUnreachable
 			result.Duration = time.Since(start)
 			return result
 		}
@@ -118,6 +130,7 @@ func CheckWithRenewerAndAvatar(client *http.Client, site loader.Site, username s
 			cancel()
 		}
 		result.Error = err.Error()
+		result.Outcome = OutcomeUnreachable
 		return result
 	}
 
@@ -132,6 +145,7 @@ func CheckWithRenewerAndAvatar(client *http.Client, site loader.Site, username s
 	bodyBytes, readErr := io.ReadAll(io.LimitReader(resp.Body, 512*1024))
 	if readErr != nil && len(bodyBytes) == 0 {
 		result.Error = readErr.Error()
+		result.Outcome = OutcomeUnreachable
 		return result
 	}
 	body := string(bodyBytes)
@@ -141,6 +155,7 @@ func CheckWithRenewerAndAvatar(client *http.Client, site loader.Site, username s
 			_ = renewer.RenewCircuit()
 		}
 		result.Error = fmt.Sprintf("blocked by anti-bot protection (HTTP %d)", resp.StatusCode)
+		result.Outcome = OutcomeBlocked
 		return result
 	}
 
@@ -149,6 +164,7 @@ func CheckWithRenewerAndAvatar(client *http.Client, site loader.Site, username s
 			_ = renewer.RenewCircuit()
 		}
 		result.Error = fmt.Sprintf("rate-limited by server (HTTP %d)", resp.StatusCode)
+		result.Outcome = OutcomeBlocked
 		return result
 	}
 
@@ -157,9 +173,15 @@ func CheckWithRenewerAndAvatar(client *http.Client, site loader.Site, username s
 		finalURL = resp.Request.URL.String()
 	}
 
-	if isRedirectToLoginOrHome(targetURL, finalURL, body) {
+	if cls := classifyRedirect(targetURL, finalURL, body); cls != "" {
 		result.Error = "redirected away from profile (authwall or missing account)"
+		result.Outcome = cls
 		return result
+	}
+
+	result.Outcome = OutcomeNormal
+	if finalURL != targetURL {
+		result.Outcome = OutcomeRedirected
 	}
 
 	result.Found, result.Confidence, result.Evidence = evaluateResponse(site, username, resp.StatusCode, body, finalURL)
@@ -296,6 +318,14 @@ func isBlockedOrChallenge(statusCode int, body string) bool {
 }
 
 func isRedirectToLoginOrHome(targetURL, finalURL, body string) bool {
+	return classifyRedirect(targetURL, finalURL, body) != ""
+}
+
+// classifyRedirect reports whether the response landed on a login/authwall
+// page (OutcomeLoginRequired), on a different non-login address
+// (OutcomeRedirected), or neither (""). The login detection logic is
+// identical to what isRedirectToLoginOrHome has always used.
+func classifyRedirect(targetURL, finalURL, body string) string {
 	finalLower := strings.ToLower(finalURL)
 	targetLower := strings.ToLower(targetURL)
 
@@ -310,7 +340,7 @@ func isRedirectToLoginOrHome(targetURL, finalURL, body string) bool {
 		}
 		for _, ind := range redirectIndicators {
 			if strings.Contains(finalLower, ind) {
-				return true
+				return OutcomeLoginRequired
 			}
 		}
 	}
@@ -328,10 +358,10 @@ func isRedirectToLoginOrHome(targetURL, finalURL, body string) bool {
 	}
 	for _, marker := range loginMarkers {
 		if strings.Contains(bodyLower, marker) {
-			return true
+			return OutcomeLoginRequired
 		}
 	}
-	return false
+	return ""
 }
 
 func hasUniversalNotFoundMarkers(cleanText string) bool {
