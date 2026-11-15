@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/ashendilantha/stalkie/archive"
 	"github.com/ashendilantha/stalkie/checker"
 	"github.com/ashendilantha/stalkie/loader"
 	"github.com/ashendilantha/stalkie/matcher"
@@ -40,6 +41,10 @@ func main() {
 	outCSV := flag.String("csv", "", "Save results as .csv")
 	outJSON := flag.String("json", "", "Save results as .json")
 	outHTML := flag.String("html", "", "Save interactive relationship graph as .html")
+	archiveRoot := flag.String("archive", "", "Collection archive directory: persist per-platform records, resume interrupted scans and diff against previous runs")
+	mergeInputs := flag.String("merge", "", "Comma-separated archive directories to merge (requires -merge-out)")
+	mergeOut := flag.String("merge-out", "", "Output directory for the merged archive view")
+	recalcDir := flag.String("recalc", "", "Recompute archive statistics from archive files only")
 	minScore := flag.Int("min-score", 50, "Minimum confidence score to report as found")
 	useBrowser := flag.Bool("browser", false, "Use headless browser mode for JS-heavy sites")
 	noUTLS := flag.Bool("no-utls", false, "Disable uTLS fingerprint spoofing")
@@ -63,6 +68,40 @@ func main() {
 			os.Exit(1)
 		}
 		fmt.Printf("[*] Successfully synced and normalized %d sites into %s\n", total, *sitesFile)
+		return
+	}
+
+	if *mergeInputs != "" {
+		output.PrintBanner()
+		if *mergeOut == "" {
+			fmt.Println("[!] -merge requires -merge-out <output-dir>")
+			os.Exit(1)
+		}
+		var inputs []string
+		for _, p := range strings.Split(*mergeInputs, ",") {
+			if trimmed := strings.TrimSpace(p); trimmed != "" {
+				inputs = append(inputs, trimmed)
+			}
+		}
+		if err := archive.Merge(inputs, *mergeOut); err != nil {
+			fmt.Printf("[!] Archive merge failed: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Printf("[*] Merged %d archive(s) into %s\n", len(inputs), *mergeOut)
+		return
+	}
+
+	if *recalcDir != "" {
+		output.PrintBanner()
+		all, err := archive.RecalcAll(*recalcDir)
+		if err != nil {
+			fmt.Printf("[!] Archive recalculation failed: %v\n", err)
+			os.Exit(1)
+		}
+		for _, s := range all {
+			printStats(s)
+		}
+		fmt.Printf("[*] Recomputed statistics for %d handle(s) from %s\n", len(all), *recalcDir)
 		return
 	}
 
@@ -134,6 +173,13 @@ func main() {
 		fmt.Printf("[*] Category filter '%s': %d of %d platforms selected\n", *category, len(sites), initialCount)
 	}
 
+	if *archiveRoot != "" {
+		if err := archive.Validate(*archiveRoot, usernames, sites); err != nil {
+			fmt.Printf("[!] Archive precondition failed: %v\n", err)
+			os.Exit(1)
+		}
+	}
+
 	httpClient, err := proxy.BuildClient(proxy.Config{
 		Type:        *proxyType,
 		Address:     *proxyAddr,
@@ -159,10 +205,57 @@ func main() {
 	var allResults []checker.Result
 
 	for _, uname := range usernames {
-		fmt.Printf("\n[*] Searching: %s%s%s across %d sites\n\n",
-			"\033[1m", uname, "\033[0m", len(sites))
+		var arch *archive.Archive
+		var run archive.RunInfo
+		sitesToScan := sites
 
-		bar := progressbar.NewOptions(len(sites),
+		if *archiveRoot != "" {
+			var err error
+			arch, err = archive.Open(*archiveRoot, uname)
+			if err != nil {
+				fmt.Printf("[!] Archive open failed: %v\n", err)
+				os.Exit(1)
+			}
+			var resumed bool
+			run, resumed, err = arch.BeginRun(len(sites))
+			if err != nil {
+				fmt.Printf("[!] Archive run registration failed: %v\n", err)
+				os.Exit(1)
+			}
+			done, err := arch.CompletedSitesForRun(run.RunID)
+			if err != nil {
+				fmt.Printf("[!] Archive read failed: %v\n", err)
+				os.Exit(1)
+			}
+			var pending []loader.Site
+			for _, s := range sites {
+				if !done[s.Name] {
+					pending = append(pending, s)
+				}
+			}
+			if skipped := len(sites) - len(pending); skipped > 0 {
+				if err := arch.NoteSkipped(run, skipped); err != nil {
+					fmt.Printf("[!] Archive write failed: %v\n", err)
+					os.Exit(1)
+				}
+				fmt.Printf("[*] Archive resume: %d platform(s) already archived, %d remaining\n", skipped, len(pending))
+			}
+			if len(pending) == 0 {
+				if resumed {
+					fmt.Printf("[*] Archive run for %s already complete, finalizing\n", uname)
+					finalizeArchiveRun(arch, run)
+				} else {
+					fmt.Printf("[*] Archive for %s is complete (%d platforms), nothing to scan\n", uname, len(sites))
+				}
+				continue
+			}
+			sitesToScan = pending
+		}
+
+		fmt.Printf("\n[*] Searching: %s%s%s across %d sites\n\n",
+			"\033[1m", uname, "\033[0m", len(sitesToScan))
+
+		bar := progressbar.NewOptions(len(sitesToScan),
 			progressbar.OptionSetDescription("  scanning"),
 			progressbar.OptionSetWidth(30),
 			progressbar.OptionShowCount(),
@@ -174,6 +267,20 @@ func main() {
 			barMu.Lock()
 			bar.Add(1)
 			barMu.Unlock()
+			if arch != nil {
+				adj := r
+				if *faceMatch {
+					if !adj.ImageMatched {
+						adj.Found = false
+					}
+				} else if adj.Confidence < *minScore && adj.Found {
+					adj.Found = false
+				}
+				if err := arch.AppendRecord(archive.RecordFromResult(run.RunID, adj)); err != nil {
+					fmt.Printf("\n[!] Archive write failed: %v\n", err)
+					os.Exit(1)
+				}
+			}
 		}
 
 		start := time.Now()
@@ -181,7 +288,7 @@ func main() {
 		var results []checker.Result
 		if *useBrowser {
 			results = checker.CheckAllWithBrowser(
-				sites,
+				sitesToScan,
 				uname,
 				*workers,
 				rateLimit,
@@ -194,7 +301,7 @@ func main() {
 				onResult,
 			)
 		} else {
-			results = checker.CheckAllWithOptions(httpClient, sites, uname, *workers, rateLimit, *retries, torRenewer, refAvatar, *minSim, onResult)
+			results = checker.CheckAllWithOptions(httpClient, sitesToScan, uname, *workers, rateLimit, *retries, torRenewer, refAvatar, *minSim, onResult)
 		}
 
 		bar.Finish()
@@ -217,6 +324,12 @@ func main() {
 		}
 
 		output.PrintSummary(results, uname, time.Since(start))
+
+		if arch != nil {
+			finalizeArchiveRun(arch, run)
+			fmt.Printf("[*] Archive updated -> %s (stats: stats.txt / stats.json)\n", arch.Dir)
+			arch.Close()
+		}
 	}
 
 	if len(usernames) > 1 {
@@ -267,4 +380,61 @@ func main() {
 			fmt.Printf("[*] Saved HTML graph -> %s\n", *outHTML)
 		}
 	}
+}
+
+// finalizeArchiveRun diffs the run against the previous archive state,
+// persists changes and statistics, and marks the run finished.
+func finalizeArchiveRun(arch *archive.Archive, run archive.RunInfo) {
+	changes, err := arch.DiffRun(run)
+	if err != nil {
+		fmt.Printf("[!] Archive diff failed: %v\n", err)
+		os.Exit(1)
+	}
+	if err := arch.AppendChanges(changes); err != nil {
+		fmt.Printf("[!] Archive change log write failed: %v\n", err)
+		os.Exit(1)
+	}
+	if err := arch.FinishRun(run); err != nil {
+		fmt.Printf("[!] Archive run finalization failed: %v\n", err)
+		os.Exit(1)
+	}
+	stats, err := arch.RecalcStats()
+	if err != nil {
+		fmt.Printf("[!] Archive stats failed: %v\n", err)
+		os.Exit(1)
+	}
+	if err := arch.WriteStats(stats); err != nil {
+		fmt.Printf("[!] Archive stats write failed: %v\n", err)
+		os.Exit(1)
+	}
+	printChanges(changes)
+	printStats(stats)
+}
+
+func printChanges(changes []archive.Change) {
+	if len(changes) == 0 {
+		fmt.Println("[*] No changes vs previous run")
+		return
+	}
+	fmt.Printf("[*] %d change(s) vs previous run:\n", len(changes))
+	for _, c := range changes {
+		switch c.Type {
+		case archive.ChangeNewHit:
+			fmt.Printf("    [new hit]            %s (confidence %d%%, %s)\n", c.Site, c.After.Confidence, c.After.Evidence)
+		case archive.ChangeLostHit:
+			fmt.Printf("    [lost hit]           %s (was confidence %d%%, %s)\n", c.Site, c.Before.Confidence, c.Before.Evidence)
+		case archive.ChangeEvidenceChanged:
+			fmt.Printf("    [evidence changed]   %s\n        before: %s\n        after:  %s\n", c.Site, c.Before.Evidence, c.After.Evidence)
+		case archive.ChangeConfidenceChanged:
+			fmt.Printf("    [confidence changed] %s %d%% -> %d%%\n", c.Site, c.Before.Confidence, c.After.Confidence)
+		}
+	}
+}
+
+func printStats(s archive.Stats) {
+	fmt.Printf("[*] Archive stats (run %s):\n", s.RunID)
+	fmt.Printf("    submitted: %d  found: %d  blocked: %d  login_required: %d  redirected: %d  unreachable: %d  skipped: %d\n",
+		s.Submitted, s.Found, s.Blocked, s.LoginRequired, s.Redirected, s.Unreachable, s.Skipped)
+	fmt.Printf("    first_observed: %d  unchanged: %d  new_hits: %d  lost_hits: %d  evidence_changed: %d  confidence_changed: %d\n",
+		s.FirstObserved, s.Unchanged, s.NewHits, s.LostHits, s.EvidenceChanged, s.ConfidenceChanged)
 }

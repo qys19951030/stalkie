@@ -62,6 +62,7 @@ type RunInfo struct {
 	StartedAt  time.Time `json:"started_at"`
 	FinishedAt time.Time `json:"finished_at"`
 	SitesTotal int       `json:"sites_total"`
+	Skipped    int       `json:"skipped"`
 }
 
 // Snapshot is the before/after state carried by a Change.
@@ -260,7 +261,68 @@ func appendJSONL(path string, items ...any) error {
 // archive path writable, handles non-empty, site database non-empty and
 // every platform already recorded in the archive present in the site DB.
 func Validate(root string, handles []string, sites []loader.Site) error {
+	if len(sites) == 0 {
+		return fmt.Errorf("site database is empty")
+	}
+	if len(handles) == 0 {
+		return fmt.Errorf("no target handle given")
+	}
+	for _, h := range handles {
+		if strings.TrimSpace(h) == "" {
+			return fmt.Errorf("empty handle")
+		}
+	}
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		return fmt.Errorf("archive path not writable: %w", err)
+	}
+	probe := filepath.Join(root, ".stalkie-write-probe")
+	if err := os.WriteFile(probe, []byte("ok"), 0o644); err != nil {
+		return fmt.Errorf("archive path not writable: %w", err)
+	}
+	_ = os.Remove(probe)
+
+	known := make(map[string]bool, len(sites))
+	for _, s := range sites {
+		known[s.Name] = true
+	}
+	for _, h := range handles {
+		dir := filepath.Join(root, sanitizeHandle(strings.TrimSpace(h)))
+		var records []Record
+		if err := readJSONL(filepath.Join(dir, recordsFile), &records); err != nil {
+			return err
+		}
+		for _, r := range records {
+			if !known[r.Site] {
+				return fmt.Errorf("archive/platform mismatch: archive for handle %q records platform %q which is not in the current site database", strings.TrimSpace(h), r.Site)
+			}
+		}
+	}
 	return nil
+}
+
+// RecalcAll recomputes and rewrites the statistics of every handle in an
+// archive root, using only the archive files on disk.
+func RecalcAll(root string) ([]Stats, error) {
+	dirs, err := handleDirs(root)
+	if err != nil {
+		return nil, err
+	}
+	var all []Stats
+	for _, d := range dirs {
+		a, err := Open(root, d)
+		if err != nil {
+			return nil, err
+		}
+		s, err := a.RecalcStats()
+		if err != nil {
+			return nil, err
+		}
+		if err := a.WriteStats(s); err != nil {
+			return nil, err
+		}
+		all = append(all, s)
+	}
+	return all, nil
 }
 
 // Open opens (or creates) the archive directory for one handle, repairing
@@ -309,33 +371,67 @@ func (a *Archive) CompletedSites() (map[string]bool, error) {
 	return done, nil
 }
 
-// BeginRun registers a new run and returns its descriptor.
-func (a *Archive) BeginRun(sitesTotal int) (RunInfo, error) {
+// BeginRun registers a new run and returns its descriptor. If the latest
+// run never finished (the process was interrupted), that run is resumed
+// instead: its ID is returned and resumed is true, so already archived
+// platforms of that run are not requested again.
+func (a *Archive) BeginRun(sitesTotal int) (RunInfo, bool, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	var runs []RunInfo
+	if err := readJSONL(filepath.Join(a.Dir, runsFile), &runs); err != nil {
+		return RunInfo{}, false, err
+	}
+	if len(runs) > 0 {
+		latest := runs[len(runs)-1]
+		if latest.FinishedAt.IsZero() {
+			return latest, true, nil
+		}
+	}
+
 	run := RunInfo{
 		RunID:      fmt.Sprintf("%s-%s", time.Now().UTC().Format("20060102T150405"), newID("run")),
 		Handle:     a.Handle,
 		StartedAt:  time.Now().UTC(),
 		SitesTotal: sitesTotal,
 	}
-	a.mu.Lock()
-	defer a.mu.Unlock()
 	if err := appendJSONL(filepath.Join(a.Dir, runsFile), run); err != nil {
-		return RunInfo{}, err
+		return RunInfo{}, false, err
 	}
-	return run, nil
+	return run, false, nil
 }
 
-// AppendRecord persists one platform record; safe for concurrent use.
-func (a *Archive) AppendRecord(rec Record) error {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	return appendJSONL(filepath.Join(a.Dir, recordsFile), rec)
+// CompletedSitesForRun returns the platforms that already have a record
+// under the given run.
+func (a *Archive) CompletedSitesForRun(runID string) (map[string]bool, error) {
+	records, err := a.Records()
+	if err != nil {
+		return nil, err
+	}
+	done := make(map[string]bool)
+	for _, r := range records {
+		if r.RunID == runID {
+			done[r.Site] = true
+		}
+	}
+	return done, nil
 }
 
-// FinishRun marks a run finished in the runs log.
-func (a *Archive) FinishRun(run RunInfo) error {
+// NoteSkipped records how many platforms were skipped (already archived)
+// when the run was (re)started. The value is set, not accumulated, so
+// repeated resumes of the same run never double-count.
+func (a *Archive) NoteSkipped(run RunInfo, skipped int) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	return a.updateRunLocked(run.RunID, func(r *RunInfo) {
+		r.Skipped = skipped
+	})
+}
+
+// updateRunLocked rewrites runs.jsonl applying fn to the matching entry.
+// The caller must hold a.mu.
+func (a *Archive) updateRunLocked(runID string, fn func(*RunInfo)) error {
 	path := filepath.Join(a.Dir, runsFile)
 	var runs []RunInfo
 	if err := readJSONL(path, &runs); err != nil {
@@ -343,28 +439,22 @@ func (a *Archive) FinishRun(run RunInfo) error {
 	}
 	found := false
 	for i := range runs {
-		if runs[i].RunID == run.RunID {
-			run.FinishedAt = time.Now().UTC()
-			runs[i] = run
+		if runs[i].RunID == runID {
+			fn(&runs[i])
 			found = true
 			break
 		}
 	}
 	if !found {
-		run.FinishedAt = time.Now().UTC()
-		runs = append(runs, run)
-	}
-	var lines []any
-	for i := range runs {
-		lines = append(lines, runs[i])
+		return fmt.Errorf("run %q not found", runID)
 	}
 	tmp := path + ".tmp"
 	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
 	if err != nil {
 		return err
 	}
-	for _, item := range lines {
-		data, err := json.Marshal(item)
+	for i := range runs {
+		data, err := json.Marshal(runs[i])
 		if err != nil {
 			f.Close()
 			os.Remove(tmp)
@@ -386,6 +476,22 @@ func (a *Archive) FinishRun(run RunInfo) error {
 		return err
 	}
 	return os.Rename(tmp, path)
+}
+
+// AppendRecord persists one platform record; safe for concurrent use.
+func (a *Archive) AppendRecord(rec Record) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return appendJSONL(filepath.Join(a.Dir, recordsFile), rec)
+}
+
+// FinishRun marks a run finished in the runs log.
+func (a *Archive) FinishRun(run RunInfo) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.updateRunLocked(run.RunID, func(r *RunInfo) {
+		r.FinishedAt = time.Now().UTC()
+	})
 }
 
 // Records returns every stored record in file order.
@@ -467,6 +573,36 @@ func DetectChanges(run RunInfo, baseline map[string]Record, fresh []Record) []Ch
 	return changes
 }
 
+// DiffRun computes the changes of a whole run against the archive state
+// that existed before the run started. It is purely file-driven, so it
+// also covers records written by a previous, interrupted attempt of the
+// same run.
+func (a *Archive) DiffRun(run RunInfo) ([]Change, error) {
+	records, err := a.Records()
+	if err != nil {
+		return nil, err
+	}
+	baseline := make(map[string]Record)
+	fresh := make(map[string]Record)
+	for _, r := range records {
+		if r.RunID == run.RunID {
+			fresh[r.Site] = r
+			continue
+		}
+		if r.CheckedAt.Before(run.StartedAt) {
+			cur, ok := baseline[r.Site]
+			if !ok || !r.CheckedAt.Before(cur.CheckedAt) {
+				baseline[r.Site] = r
+			}
+		}
+	}
+	freshList := make([]Record, 0, len(fresh))
+	for _, r := range fresh {
+		freshList = append(freshList, r)
+	}
+	return DetectChanges(run, baseline, freshList), nil
+}
+
 // AppendChanges persists detected changes to the changes log.
 func (a *Archive) AppendChanges(changes []Change) error {
 	if len(changes) == 0 {
@@ -521,7 +657,7 @@ func (a *Archive) RecalcStats() (Stats, error) {
 			priorSites[r.Site] = true
 		}
 	}
-	stats.Skipped = len(priorSites)
+	stats.Skipped = latest.Skipped
 
 	stats.Submitted = len(runRecords)
 	compared := 0
